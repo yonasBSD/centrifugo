@@ -39,6 +39,7 @@ import (
 	"github.com/centrifugal/centrifugo/v5/internal/build"
 	"github.com/centrifugal/centrifugo/v5/internal/cli"
 	"github.com/centrifugal/centrifugo/v5/internal/client"
+	"github.com/centrifugal/centrifugo/v5/internal/consuming"
 	"github.com/centrifugal/centrifugo/v5/internal/health"
 	"github.com/centrifugal/centrifugo/v5/internal/jwtutils"
 	"github.com/centrifugal/centrifugo/v5/internal/jwtverify"
@@ -49,7 +50,10 @@ import (
 	"github.com/centrifugal/centrifugo/v5/internal/notify"
 	"github.com/centrifugal/centrifugo/v5/internal/origin"
 	"github.com/centrifugal/centrifugo/v5/internal/proxy"
+	"github.com/centrifugal/centrifugo/v5/internal/redisnatsbroker"
 	"github.com/centrifugal/centrifugo/v5/internal/rule"
+	"github.com/centrifugal/centrifugo/v5/internal/service"
+	"github.com/centrifugal/centrifugo/v5/internal/sockjs"
 	"github.com/centrifugal/centrifugo/v5/internal/survey"
 	"github.com/centrifugal/centrifugo/v5/internal/swaggerui"
 	"github.com/centrifugal/centrifugo/v5/internal/telemetry"
@@ -79,6 +83,7 @@ import (
 	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	_ "google.golang.org/grpc/encoding/gzip"
@@ -98,8 +103,9 @@ var defaults = map[string]any{
 
 	"granular_proxy_mode": false,
 
-	"opentelemetry":     false,
-	"opentelemetry_api": false,
+	"opentelemetry":           false,
+	"opentelemetry_api":       false,
+	"opentelemetry_consuming": false,
 
 	"client_insecure": false,
 	"client_insecure_skip_token_signature_verify": false,
@@ -128,8 +134,9 @@ var defaults = map[string]any{
 
 	"allowed_origins": []string{},
 
-	"global_history_meta_ttl": 30 * 24 * time.Hour,
-	"global_presence_ttl":     60 * time.Second,
+	"global_history_meta_ttl":            30 * 24 * time.Hour,
+	"global_presence_ttl":                60 * time.Second,
+	"global_redis_presence_user_mapping": false,
 
 	"presence":                      false,
 	"join_leave":                    false,
@@ -236,6 +243,8 @@ var defaults = map[string]any{
 	"tls_key_pem":              "",
 	"tls_root_ca":              "",
 	"tls_root_ca_pem":          "",
+	"tls_client_ca":            "",
+	"tls_client_ca_pem":        "",
 	"tls_server_name":          "",
 	"tls_insecure_skip_verify": false,
 
@@ -315,6 +324,8 @@ var defaults = map[string]any{
 	"grpc_api_tls_key_pem":              "",
 	"grpc_api_tls_root_ca":              "",
 	"grpc_api_tls_root_ca_pem":          "",
+	"grpc_api_tls_client_ca":            "",
+	"grpc_api_tls_client_ca_pem":        "",
 	"grpc_api_tls_server_name":          "",
 	"grpc_api_tls_insecure_skip_verify": false,
 
@@ -357,6 +368,8 @@ var defaults = map[string]any{
 	"uni_grpc_tls_key_pem":              "",
 	"uni_grpc_tls_root_ca":              "",
 	"uni_grpc_tls_root_ca_pem":          "",
+	"uni_grpc_tls_client_ca":            "",
+	"uni_grpc_tls_client_ca_pem":        "",
 	"uni_grpc_tls_server_name":          "",
 	"uni_grpc_tls_insecure_skip_verify": false,
 
@@ -387,6 +400,10 @@ var defaults = map[string]any{
 
 	"proxy_grpc_credentials_key":   "",
 	"proxy_grpc_credentials_value": "",
+
+	"enable_unreleased_features": false,
+
+	"consumers": []any{},
 }
 
 func init() {
@@ -418,6 +435,8 @@ func init() {
 			prefix + "redis_tls_key_pem":                       "",
 			prefix + "redis_tls_root_ca":                       "",
 			prefix + "redis_tls_root_ca_pem":                   "",
+			prefix + "redis_tls_client_ca":                     "",
+			prefix + "redis_tls_client_ca_pem":                 "",
 			prefix + "redis_tls_server_name":                   "",
 			prefix + "redis_tls_insecure_skip_verify":          false,
 			prefix + "redis_sentinel_tls":                      false,
@@ -427,6 +446,8 @@ func init() {
 			prefix + "redis_sentinel_tls_key_pem":              "",
 			prefix + "redis_sentinel_tls_root_ca":              "",
 			prefix + "redis_sentinel_tls_root_ca_pem":          "",
+			prefix + "redis_sentinel_tls_client_ca":            "",
+			prefix + "redis_sentinel_tls_client_ca_pem":        "",
 			prefix + "redis_sentinel_tls_server_name":          "",
 			prefix + "redis_sentinel_tls_insecure_skip_verify": false,
 		}
@@ -485,8 +506,9 @@ func main() {
 			err = viper.ReadInConfig()
 			configFound := true
 			if err != nil {
-				switch err.(type) {
-				case viper.ConfigParseError:
+				var configParseError viper.ConfigParseError
+				switch {
+				case errors.As(err, &configParseError):
 					log.Fatal().Msg(tools.ErrorMessageFromConfigError(err, absConfPath))
 				default:
 					configFound = false
@@ -573,11 +595,52 @@ func main() {
 				broker, presenceManager, engineMode, err = redisEngine(node)
 			} else if engineName == "tarantool" {
 				broker, presenceManager, engineMode, err = tarantoolEngine(node)
+			} else if engineName == "redisnats" {
+				if !viper.GetBool("enable_unreleased_features") {
+					log.Fatal().Msg("redisnats engine requires enable_unreleased_features on")
+				}
+				log.Warn().Msg("redisnats engine is not released, it may be changed or removed at any point")
+				var natsBroker *natsbroker.NatsBroker
+				var redisBroker *centrifuge.RedisBroker
+				redisBroker, presenceManager, engineMode, err = redisEngine(node)
+				if err != nil {
+					log.Fatal().Msgf("error creating redis engine: %v", err)
+				}
+				natsBroker, err = initNatsBroker(node)
+				if err != nil {
+					log.Fatal().Msgf("error creating nats broker: %v", err)
+				}
+				broker, err = redisnatsbroker.New(natsBroker, redisBroker)
 			} else {
 				log.Fatal().Msgf("unknown engine: %s", engineName)
 			}
 			if err != nil {
 				log.Fatal().Msgf("error creating engine: %v", err)
+			}
+			node.SetBroker(broker)
+			node.SetPresenceManager(presenceManager)
+
+			if !configFound {
+				log.Warn().Msg("config file not found")
+			}
+
+			var disableHistoryPresence bool
+			if engineName == "memory" && brokerName == "nats" {
+				// Presence and History won't work with Memory engine in distributed case.
+				disableHistoryPresence = true
+				node.SetPresenceManager(nil)
+			}
+
+			if disableHistoryPresence {
+				log.Warn().Msgf("presence, history and recovery disabled with Memory engine and Nats broker")
+			}
+
+			if brokerName == "nats" {
+				broker, err = initNatsBroker(node)
+				if err != nil {
+					log.Fatal().Msgf("error creating broker: %v", err)
+				}
+				node.SetBroker(broker)
 			}
 
 			tokenVerifier, err := jwtverify.NewTokenVerifierJWT(jwtVerifierConfig(), ruleContainer)
@@ -604,40 +667,34 @@ func main() {
 			surveyCaller := survey.NewCaller(node)
 
 			useAPIOpentelemetry := viper.GetBool("opentelemetry") && viper.GetBool("opentelemetry_api")
+			useConsumingOpentelemetry := viper.GetBool("opentelemetry") && viper.GetBool("opentelemetry_consuming")
 
-			httpAPIExecutor := api.NewExecutor(node, ruleContainer, surveyCaller, "http", useAPIOpentelemetry)
-			grpcAPIExecutor := api.NewExecutor(node, ruleContainer, surveyCaller, "grpc", useAPIOpentelemetry)
+			httpAPIExecutor := api.NewExecutor(node, ruleContainer, surveyCaller, api.ExecutorConfig{
+				Protocol:         "http",
+				UseOpenTelemetry: useAPIOpentelemetry,
+			})
+			grpcAPIExecutor := api.NewExecutor(node, ruleContainer, surveyCaller, api.ExecutorConfig{
+				Protocol:         "grpc",
+				UseOpenTelemetry: useAPIOpentelemetry,
+			})
+			consumingAPIExecutor := api.NewExecutor(node, ruleContainer, surveyCaller, api.ExecutorConfig{
+				Protocol:         "consuming",
+				UseOpenTelemetry: useConsumingOpentelemetry,
+			})
 
-			node.SetBroker(broker)
-			node.SetPresenceManager(presenceManager)
+			var services []service.Service
 
-			var disableHistoryPresence bool
-			if engineName == "memory" && brokerName == "nats" {
-				// Presence and History won't work with Memory engine in distributed case.
-				disableHistoryPresence = true
-				node.SetPresenceManager(nil)
+			consumingHandler := api.NewConsumingHandler(node, consumingAPIExecutor, api.ConsumingHandlerConfig{
+				UseOpenTelemetry: useConsumingOpentelemetry,
+			})
+
+			consumers := consumersFromConfig(viper.GetViper())
+			consumingServices, err := consuming.New(node.ID(), node, consumingHandler, consumers)
+			if err != nil {
+				log.Fatal().Msgf("error initializing consumers: %v", err)
 			}
 
-			if disableHistoryPresence {
-				log.Warn().Msgf("presence, history and recovery disabled with Memory engine and Nats broker")
-			}
-
-			if !configFound {
-				log.Warn().Msg("config file not found")
-			}
-
-			if brokerName == "nats" {
-				broker, err := natsbroker.New(node, natsbroker.Config{
-					URL:          viper.GetString("nats_url"),
-					Prefix:       viper.GetString("nats_prefix"),
-					DialTimeout:  GetDuration("nats_dial_timeout"),
-					WriteTimeout: GetDuration("nats_write_timeout"),
-				})
-				if err != nil {
-					log.Fatal().Msgf("Error creating broker: %v", err)
-				}
-				node.SetBroker(broker)
-			}
+			services = append(services, consumingServices...)
 
 			if err = node.Run(); err != nil {
 				log.Fatal().Msgf("error running node: %v", err)
@@ -757,7 +814,7 @@ func main() {
 			}
 
 			keepHeadersInContext := proxyEnabled
-			servers, err := runHTTPServers(node, ruleContainer, httpAPIExecutor, keepHeadersInContext)
+			httpServers, err := runHTTPServers(node, ruleContainer, httpAPIExecutor, keepHeadersInContext)
 			if err != nil {
 				log.Fatal().Msgf("error running HTTP server: %v", err)
 			}
@@ -771,6 +828,7 @@ func main() {
 					Interval: GetDuration("graphite_interval"),
 					Tags:     viper.GetBool("graphite_tags"),
 				})
+				services = append(services, exporter)
 			}
 
 			var statsSender *usage.Sender
@@ -792,6 +850,8 @@ func main() {
 					UniSSE:        viper.GetBool("uni_sse"),
 					UniGRPC:       viper.GetBool("uni_grpc"),
 
+					EnabledConsumers: usage.GetEnabledConsumers(consumers),
+
 					GrpcAPI:             viper.GetBool("grpc_api"),
 					SubscribeToPersonal: viper.GetBool("user_subscribe_to_personal"),
 					Admin:               viper.GetBool("admin"),
@@ -809,14 +869,32 @@ func main() {
 					Throttling:          false,
 					Singleflight:        false,
 				})
-				go statsSender.Start(context.Background())
+				services = append(services, statsSender)
 			}
 
 			notify.RegisterHandlers(node, statsSender)
 
 			tools.CheckPlainConfigKeys(defaults, viper.AllKeys())
 
-			handleSignals(configFile, node, ruleContainer, tokenVerifier, subTokenVerifier, servers, grpcAPIServer, grpcUniServer, exporter)
+			var serviceGroup *errgroup.Group
+			serviceCancel := func() {}
+			if len(services) > 0 {
+				var serviceCtx context.Context
+				serviceCtx, serviceCancel = context.WithCancel(context.Background())
+				serviceGroup, serviceCtx = errgroup.WithContext(serviceCtx)
+				for _, s := range services {
+					s := s
+					serviceGroup.Go(func() error {
+						return s.Run(serviceCtx)
+					})
+				}
+			}
+
+			handleSignals(
+				configFile, node, ruleContainer, tokenVerifier, subTokenVerifier,
+				httpServers, grpcAPIServer, grpcUniServer,
+				serviceGroup, serviceCancel,
+			)
 		},
 	}
 
@@ -931,7 +1009,7 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			bindCentrifugoConfig()
 			err := readConfig(genTokenConfigFile)
-			if err != nil && err != errConfigFileNotFound {
+			if err != nil && !errors.Is(err, errConfigFileNotFound) {
 				fmt.Printf("error: %v\n", err)
 				os.Exit(1)
 			}
@@ -974,7 +1052,7 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			bindCentrifugoConfig()
 			err := readConfig(genSubTokenConfigFile)
-			if err != nil && err != errConfigFileNotFound {
+			if err != nil && !errors.Is(err, errConfigFileNotFound) {
 				fmt.Printf("error: %v\n", err)
 				os.Exit(1)
 			}
@@ -996,8 +1074,8 @@ func main() {
 				user = "anonymous user"
 			}
 			exp := "without expiration"
-			if genTokenTTL >= 0 {
-				exp = fmt.Sprintf("with expiration TTL %s", time.Duration(genTokenTTL)*time.Second)
+			if genSubTokenTTL >= 0 {
+				exp = fmt.Sprintf("with expiration TTL %s", time.Duration(genSubTokenTTL)*time.Second)
 			}
 			if genSubTokenQuiet {
 				fmt.Print(token)
@@ -1021,7 +1099,7 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			bindCentrifugoConfig()
 			err := readConfig(checkTokenConfigFile)
-			if err != nil && err != errConfigFileNotFound {
+			if err != nil && !errors.Is(err, errConfigFileNotFound) {
 				fmt.Printf("error: %v\n", err)
 				os.Exit(1)
 			}
@@ -1053,7 +1131,7 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			bindCentrifugoConfig()
 			err := readConfig(checkSubTokenConfigFile)
-			if err != nil && err != errConfigFileNotFound {
+			if err != nil && !errors.Is(err, errConfigFileNotFound) {
 				fmt.Printf("error: %v\n", err)
 				os.Exit(1)
 			}
@@ -1168,7 +1246,11 @@ func setupLogging() *os.File {
 	return nil
 }
 
-func handleSignals(configFile string, n *centrifuge.Node, ruleContainer *rule.Container, tokenVerifier *jwtverify.VerifierJWT, subTokenVerifier *jwtverify.VerifierJWT, httpServers []*http.Server, grpcAPIServer *grpc.Server, grpcUniServer *grpc.Server, exporter *graphite.Exporter) {
+func handleSignals(
+	configFile string, n *centrifuge.Node, ruleContainer *rule.Container, tokenVerifier *jwtverify.VerifierJWT,
+	subTokenVerifier *jwtverify.VerifierJWT, httpServers []*http.Server, grpcAPIServer *grpc.Server, grpcUniServer *grpc.Server,
+	serviceGroup *errgroup.Group, serviceCancel context.CancelFunc,
+) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, os.Interrupt, syscall.SIGTERM)
 	for {
@@ -1176,7 +1258,9 @@ func handleSignals(configFile string, n *centrifuge.Node, ruleContainer *rule.Co
 		log.Info().Msgf("signal received: %v", sig)
 		switch sig {
 		case syscall.SIGHUP:
-			// reload application configuration on SIGHUP.
+			// Reload application configuration on SIGHUP.
+			// Note that Centrifugo can't reload config for everything – just best effort to reload what's possible.
+			// We can now reload channel options and token verifiers.
 			log.Info().Msg("reloading configuration")
 			err := validateConfig(configFile)
 			if err != nil {
@@ -1210,11 +1294,16 @@ func handleSignals(configFile string, n *centrifuge.Node, ruleContainer *rule.Co
 				os.Exit(1)
 			})
 
-			if exporter != nil {
-				_ = exporter.Close()
-			}
-
 			var wg sync.WaitGroup
+
+			if serviceGroup != nil {
+				serviceCancel()
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = serviceGroup.Wait()
+				}()
+			}
 
 			if grpcAPIServer != nil {
 				wg.Add(1)
@@ -1318,18 +1407,18 @@ func getTLSConfig() (*tls.Config, error) {
 
 	} else if tlsEnabled {
 		// Autocert disabled - just try to use provided SSL cert and key files.
-		return tools.MakeTLSConfig(viper.GetViper(), "")
+		return tools.MakeTLSConfig(viper.GetViper(), "", os.ReadFile)
 	}
 
 	return nil, nil
 }
 
 func tlsConfigForGRPC() (*tls.Config, error) {
-	return tools.MakeTLSConfig(viper.GetViper(), "grpc_api_")
+	return tools.MakeTLSConfig(viper.GetViper(), "grpc_api_", os.ReadFile)
 }
 
 func tlsConfigForUniGRPC() (*tls.Config, error) {
-	return tools.MakeTLSConfig(viper.GetViper(), "uni_grpc_")
+	return tools.MakeTLSConfig(viper.GetViper(), "uni_grpc_", os.ReadFile)
 }
 
 type httpErrorLogWriter struct {
@@ -1543,7 +1632,7 @@ func runHTTPServers(n *centrifuge.Node, ruleContainer *rule.Container, apiExecut
 				select {
 				case err := <-hErr:
 					_ = wtServer.Close()
-					if err != http.ErrServerClosed {
+					if !errors.Is(err, http.ErrServerClosed) {
 						log.Fatal().Msgf("ListenAndServe: %v", err)
 					}
 				case err := <-qErr:
@@ -1553,13 +1642,13 @@ func runHTTPServers(n *centrifuge.Node, ruleContainer *rule.Container, apiExecut
 			} else {
 				if addrTLSConfig != nil {
 					if err := server.ListenAndServeTLS("", ""); err != nil {
-						if err != http.ErrServerClosed {
+						if !errors.Is(err, http.ErrServerClosed) {
 							log.Fatal().Msgf("ListenAndServe: %v", err)
 						}
 					}
 				} else {
 					if err := server.ListenAndServe(); err != nil {
-						if err != http.ErrServerClosed {
+						if !errors.Is(err, http.ErrServerClosed) {
 							log.Fatal().Msgf("ListenAndServe: %v", err)
 						}
 					}
@@ -1578,8 +1667,9 @@ func readConfig(f string) error {
 	viper.SetConfigFile(f)
 	err := viper.ReadInConfig()
 	if err != nil {
-		switch err.(type) {
-		case viper.ConfigParseError:
+		var configParseError viper.ConfigParseError
+		switch {
+		case errors.As(err, &configParseError):
 			return err
 		default:
 			return errConfigFileNotFound
@@ -1658,6 +1748,152 @@ func ruleConfig() rule.Config {
 	cfg.ClientConnectionRateLimit = v.GetInt("client_connection_rate_limit")
 
 	return cfg
+}
+
+// rpcNamespacesFromConfig allows to unmarshal rpc namespaces.
+func rpcNamespacesFromConfig(v *viper.Viper) []rule.RpcNamespace {
+	var ns []rule.RpcNamespace
+	if !v.IsSet("rpc_namespaces") {
+		return ns
+	}
+	var jsonData []byte
+	var err error
+	switch val := v.Get("rpc_namespaces").(type) {
+	case string:
+		jsonData, _ = json.Marshal(val)
+		err = json.Unmarshal([]byte(val), &ns)
+	case []any:
+		jsonData, _ = json.Marshal(val)
+		decoderCfg := tools.DecoderConfig(&ns)
+		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
+		if newErr != nil {
+			log.Fatal().Msg(newErr.Error())
+			return ns
+		}
+		err = decoder.Decode(v.Get("rpc_namespaces"))
+	default:
+		err = fmt.Errorf("unknown rpc_namespaces type: %T", val)
+	}
+	if err != nil {
+		log.Error().Err(err).Msg("malformed rpc_namespaces")
+		os.Exit(1)
+	}
+	rule.WarnUnknownRpcNamespaceKeys(jsonData)
+	return ns
+}
+
+// namespacesFromConfig allows to unmarshal channel namespaces.
+func namespacesFromConfig(v *viper.Viper) []rule.ChannelNamespace {
+	var ns []rule.ChannelNamespace
+	if !v.IsSet("namespaces") {
+		return ns
+	}
+	var jsonData []byte
+	var err error
+	switch val := v.Get("namespaces").(type) {
+	case string:
+		jsonData = []byte(val)
+		err = json.Unmarshal([]byte(val), &ns)
+	case []any:
+		jsonData, _ = json.Marshal(val)
+		decoderCfg := tools.DecoderConfig(&ns)
+		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
+		if newErr != nil {
+			log.Fatal().Msg(newErr.Error())
+			return ns
+		}
+		err = decoder.Decode(v.Get("namespaces"))
+	default:
+		err = fmt.Errorf("unknown namespaces type: %T", val)
+	}
+	if err != nil {
+		log.Error().Err(err).Msg("malformed namespaces")
+		os.Exit(1)
+	}
+	rule.WarnUnknownNamespaceKeys(jsonData)
+	return ns
+}
+
+var proxyNamePattern = "^[-a-zA-Z0-9_.]{2,}$"
+var proxyNameRe = regexp.MustCompile(proxyNamePattern)
+
+func granularProxiesFromConfig(v *viper.Viper) []proxy.Config {
+	var proxies []proxy.Config
+	if !v.IsSet("proxies") {
+		return proxies
+	}
+	var jsonData []byte
+	var err error
+	switch val := v.Get("proxies").(type) {
+	case string:
+		jsonData = []byte(val)
+		err = json.Unmarshal([]byte(val), &proxies)
+	case []any:
+		jsonData, _ = json.Marshal(val)
+		decoderCfg := tools.DecoderConfig(&proxies)
+		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
+		if newErr != nil {
+			log.Fatal().Msg(newErr.Error())
+			return proxies
+		}
+		err = decoder.Decode(v.Get("proxies"))
+	default:
+		err = fmt.Errorf("unknown proxies type: %T", val)
+	}
+	if err != nil {
+		log.Fatal().Err(err).Msg("malformed proxies")
+	}
+	names := map[string]struct{}{}
+	for _, p := range proxies {
+		if !proxyNameRe.Match([]byte(p.Name)) {
+			log.Fatal().Msgf("invalid proxy name: %s, must match %s regular expression", p.Name, proxyNamePattern)
+		}
+		if _, ok := names[p.Name]; ok {
+			log.Fatal().Msgf("duplicate proxy name: %s", p.Name)
+		}
+		if p.Timeout == 0 {
+			p.Timeout = tools.Duration(time.Second)
+		}
+		if p.Endpoint == "" {
+			log.Fatal().Msgf("no endpoint set for proxy %s", p.Name)
+		}
+		names[p.Name] = struct{}{}
+	}
+
+	proxy.WarnUnknownProxyKeys(jsonData)
+
+	return proxies
+}
+
+// consumersFromConfig allows to unmarshal rpc namespaces.
+func consumersFromConfig(v *viper.Viper) []consuming.ConsumerConfig {
+	var consumers []consuming.ConsumerConfig
+	if !v.IsSet("consumers") {
+		return consumers
+	}
+	var jsonData []byte
+	var err error
+	switch val := v.Get("consumers").(type) {
+	case string:
+		jsonData, _ = json.Marshal(val)
+		err = json.Unmarshal([]byte(val), &consumers)
+	case []any:
+		jsonData, _ = json.Marshal(val)
+		decoderCfg := tools.DecoderConfig(&consumers)
+		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
+		if newErr != nil {
+			log.Fatal().Msg(newErr.Error())
+		}
+		err = decoder.Decode(v.Get("consumers"))
+	default:
+		err = fmt.Errorf("unknown consumers type: %T", val)
+	}
+	if err != nil {
+		log.Error().Err(err).Msg("malformed consumers")
+		os.Exit(1)
+	}
+	consuming.WarnUnknownConsumerConfigKeys(jsonData)
+	return consumers
 }
 
 func jwtVerifierConfig() jwtverify.VerifierConfig {
@@ -2075,57 +2311,6 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 	return proxyMap, proxyEnabled
 }
 
-var proxyNamePattern = "^[-a-zA-Z0-9_.]{2,}$"
-var proxyNameRe = regexp.MustCompile(proxyNamePattern)
-
-func granularProxiesFromConfig(v *viper.Viper) []proxy.Config {
-	var proxies []proxy.Config
-	if !v.IsSet("proxies") {
-		return proxies
-	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("proxies").(type) {
-	case string:
-		jsonData = []byte(val)
-		err = json.Unmarshal([]byte(val), &proxies)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&proxies)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-			return proxies
-		}
-		err = decoder.Decode(v.Get("proxies"))
-	default:
-		err = fmt.Errorf("unknown proxies type: %T", val)
-	}
-	if err != nil {
-		log.Fatal().Err(err).Msg("malformed proxies")
-	}
-	names := map[string]struct{}{}
-	for _, p := range proxies {
-		if !proxyNameRe.Match([]byte(p.Name)) {
-			log.Fatal().Msgf("invalid proxy name: %s, must match %s regular expression", p.Name, proxyNamePattern)
-		}
-		if _, ok := names[p.Name]; ok {
-			log.Fatal().Msgf("duplicate proxy name: %s", p.Name)
-		}
-		if p.Timeout == 0 {
-			p.Timeout = tools.Duration(time.Second)
-		}
-		if p.Endpoint == "" {
-			log.Fatal().Msgf("no endpoint set for proxy %s", p.Name)
-		}
-		names[p.Name] = struct{}{}
-	}
-
-	proxy.WarnUnknownProxyKeys(jsonData)
-
-	return proxies
-}
-
 func nodeConfig(version string) centrifuge.Config {
 	v := viper.GetViper()
 	cfg := centrifuge.Config{}
@@ -2180,70 +2365,6 @@ func applicationName() string {
 		hostname = "?"
 	}
 	return hostname + "_" + port
-}
-
-// namespacesFromConfig allows to unmarshal channel namespaces.
-func namespacesFromConfig(v *viper.Viper) []rule.ChannelNamespace {
-	var ns []rule.ChannelNamespace
-	if !v.IsSet("namespaces") {
-		return ns
-	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("namespaces").(type) {
-	case string:
-		jsonData = []byte(val)
-		err = json.Unmarshal([]byte(val), &ns)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&ns)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-			return ns
-		}
-		err = decoder.Decode(v.Get("namespaces"))
-	default:
-		err = fmt.Errorf("unknown namespaces type: %T", val)
-	}
-	if err != nil {
-		log.Error().Err(err).Msg("malformed namespaces")
-		os.Exit(1)
-	}
-	rule.WarnUnknownNamespaceKeys(jsonData)
-	return ns
-}
-
-// rpcNamespacesFromConfig allows to unmarshal rpc namespaces.
-func rpcNamespacesFromConfig(v *viper.Viper) []rule.RpcNamespace {
-	var ns []rule.RpcNamespace
-	if !v.IsSet("rpc_namespaces") {
-		return ns
-	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("rpc_namespaces").(type) {
-	case string:
-		jsonData, _ = json.Marshal(val)
-		err = json.Unmarshal([]byte(val), &ns)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&ns)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-			return ns
-		}
-		err = decoder.Decode(v.Get("rpc_namespaces"))
-	default:
-		err = fmt.Errorf("unknown rpc_namespaces type: %T", val)
-	}
-	if err != nil {
-		log.Error().Err(err).Msg("malformed rpc_namespaces")
-		os.Exit(1)
-	}
-	rule.WarnUnknownRpcNamespaceKeys(jsonData)
-	return ns
 }
 
 func getPingPongConfig() centrifuge.PingPongConfig {
@@ -2367,9 +2488,9 @@ func uniGRPCHandlerConfig() unigrpc.Config {
 	return unigrpc.Config{}
 }
 
-func sockjsHandlerConfig() centrifuge.SockjsConfig {
+func sockjsHandlerConfig() sockjs.Config {
 	v := viper.GetViper()
-	cfg := centrifuge.SockjsConfig{}
+	cfg := sockjs.Config{}
 	cfg.URL = v.GetString("sockjs_url")
 	cfg.WebsocketReadBufferSize = v.GetInt("websocket_read_buffer_size")
 	cfg.WebsocketWriteBufferSize = v.GetInt("websocket_write_buffer_size")
@@ -2435,7 +2556,7 @@ func addRedisShardCommonSettings(shardConf *centrifuge.RedisShardConfig) {
 	shardConf.ClientName = viper.GetString("redis_client_name")
 
 	if viper.GetBool("redis_tls") {
-		tlsConfig, err := tools.MakeTLSConfig(viper.GetViper(), "redis_")
+		tlsConfig, err := tools.MakeTLSConfig(viper.GetViper(), "redis_", os.ReadFile)
 		if err != nil {
 			log.Fatal().Msgf("error creating Redis TLS config: %v", err)
 		}
@@ -2498,7 +2619,7 @@ func getRedisShardConfigs() ([]centrifuge.RedisShardConfig, string, error) {
 			}
 			conf.SentinelClientName = viper.GetString("redis_sentinel_client_name")
 			if viper.GetBool("redis_sentinel_tls") {
-				tlsConfig, err := tools.MakeTLSConfig(viper.GetViper(), "redis_sentinel_")
+				tlsConfig, err := tools.MakeTLSConfig(viper.GetViper(), "redis_sentinel_", os.ReadFile)
 				if err != nil {
 					log.Fatal().Msgf("error creating Redis Sentinel TLS config: %v", err)
 				}
@@ -2546,26 +2667,43 @@ func getRedisShards(n *centrifuge.Node) ([]*centrifuge.RedisShard, string, error
 	return redisShards, mode, nil
 }
 
-func redisEngine(n *centrifuge.Node) (centrifuge.Broker, centrifuge.PresenceManager, string, error) {
+func initNatsBroker(node *centrifuge.Node) (*natsbroker.NatsBroker, error) {
+	return natsbroker.New(node, natsbroker.Config{
+		URL:          viper.GetString("nats_url"),
+		Prefix:       viper.GetString("nats_prefix"),
+		DialTimeout:  GetDuration("nats_dial_timeout"),
+		WriteTimeout: GetDuration("nats_write_timeout"),
+	})
+}
+
+func redisEngine(n *centrifuge.Node) (*centrifuge.RedisBroker, centrifuge.PresenceManager, string, error) {
 	redisShards, mode, err := getRedisShards(n)
 	if err != nil {
 		return nil, nil, "", err
 	}
 
 	broker, err := centrifuge.NewRedisBroker(n, centrifuge.RedisBrokerConfig{
-		Shards:   redisShards,
-		Prefix:   viper.GetString("redis_prefix"),
-		UseLists: viper.GetBool("redis_use_lists"),
+		Shards:     redisShards,
+		Prefix:     viper.GetString("redis_prefix"),
+		UseLists:   viper.GetBool("redis_use_lists"),
+		SkipPubSub: viper.GetString("broker") == "redisnats",
 	})
 	if err != nil {
 		return nil, nil, "", err
 	}
 
-	presenceManager, err := centrifuge.NewRedisPresenceManager(n, centrifuge.RedisPresenceManagerConfig{
+	presenceManagerConfig := centrifuge.RedisPresenceManagerConfig{
 		Shards:      redisShards,
 		Prefix:      viper.GetString("redis_prefix"),
 		PresenceTTL: GetDuration("global_presence_ttl", true),
-	})
+	}
+	if viper.GetBool("global_redis_presence_user_mapping") {
+		presenceManagerConfig.EnableUserMapping = func(_ string) bool {
+			return true
+		}
+	}
+
+	presenceManager, err := centrifuge.NewRedisPresenceManager(n, presenceManagerConfig)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -2858,7 +2996,7 @@ func Mux(n *centrifuge.Node, ruleContainer *rule.Container, apiExecutor *api.Exe
 		sockjsConfig := sockjsHandlerConfig()
 		sockjsPrefix := strings.TrimRight(v.GetString("sockjs_handler_prefix"), "/")
 		sockjsConfig.HandlerPrefix = sockjsPrefix
-		mux.Handle(sockjsPrefix+"/", connChain.Then(centrifuge.NewSockjsHandler(n, sockjsConfig)))
+		mux.Handle(sockjsPrefix+"/", connChain.Then(sockjs.NewHandler(n, sockjsConfig)))
 	}
 
 	if flags&HandlerUniWebsocket != 0 {

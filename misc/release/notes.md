@@ -8,17 +8,6 @@ For details, go to the [Centrifugo documentation site](https://centrifugal.dev).
 
 ## What's changed
 
-### Improvements
-
-* Option to extract client connection user ID from HTTP header [#730](https://github.com/centrifugal/centrifugo/pull/730). See [documentation](https://centrifugal.dev/docs/server/configuration#client_user_id_http_header) for it.
-* Speed up channel config operations by using atomic.Value and reduce allocations upon channel namespace extraction by using channel options cache, [#727](https://github.com/centrifugal/centrifugo/pull/727)
-* New metrics for the size of messages sent and received by Centrifugo real-time transport. And we finally described all the metrics exposed by Centrifugo in docs - see [Server observability -> Exposed metrics](https://centrifugal.dev/docs/server/observability#exposed-metrics)
-
 ### Fixes
 
-* Fix `Lua redis lib command arguments must be strings or integers script` error when calling Redis reversed history and the stream metadata key does not exist, [#732](https://github.com/centrifugal/centrifugo/issues/732)
-
-### Misc
-
-* Dependencies updated (rueidis, quic-go, etc)
-* Improved logging for bidirectional emulation transports and unidirectional transports - avoid unnecessary error logs
+* Fix nil pointer dereference upon calling presence stats – fixes the regression introduced by v5.2.1, [centrifugal/centrifuge#117fa3e](centrifugal/centrifuge/commit/117fa3e02289f193afa16d8b4e90e0cc4376d6a0)

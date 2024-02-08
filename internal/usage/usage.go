@@ -10,12 +10,14 @@ import (
 	"math/rand"
 	"net/http"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/centrifugal/centrifugo/v5/internal/build"
+	"github.com/centrifugal/centrifugo/v5/internal/consuming"
 	"github.com/centrifugal/centrifugo/v5/internal/rule"
 
 	"github.com/centrifugal/centrifuge"
@@ -89,6 +91,8 @@ type Features struct {
 	SubRefreshProxy      bool
 	SubscribeStreamProxy bool
 
+	EnabledConsumers []string
+
 	// Uses GRPC server API.
 	GrpcAPI bool
 	// Admin interface enabled.
@@ -122,13 +126,13 @@ func (s *Sender) isDev() bool {
 	return s.features.Version == "0.0.0"
 }
 
-// Start sending usage stats. How it works:
+// Run usage stats sender. How it works:
 // First send in between 24-48h from node start.
 // After the initial delay has passed: every hour check last time stats were sent by all
 // the nodes in a Centrifugo cluster. If no points were sent in last 24h, then push metrics
 // and update push time on all nodes (broadcast current time). There is still a chance of
 // duplicate data sending – but should be rare and tolerable for the purpose.
-func (s *Sender) Start(ctx context.Context) {
+func (s *Sender) Run(ctx context.Context) error {
 	firstTimeSend := time.Now().Add(initialDelay)
 	if s.isDev() {
 		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: schedule next send", map[string]any{"delay": initialDelay.String()}))
@@ -137,7 +141,7 @@ func (s *Sender) Start(ctx context.Context) {
 	// Wait 1/4 of a delay to randomize hourly ticks on different nodes.
 	select {
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	case <-time.After(initialDelay / 4):
 	}
 
@@ -148,7 +152,7 @@ func (s *Sender) Start(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-time.After(tickInterval):
 			if s.isDev() {
 				s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: updating max values", map[string]any{}))
@@ -393,6 +397,12 @@ func (s *Sender) prepareMetrics() ([]*metric, error) {
 	if s.features.SubscribeStreamProxy {
 		metrics = append(metrics, createPoint("proxies_enabled.subscribe_stream"))
 	}
+	if len(s.features.EnabledConsumers) > 0 {
+		metrics = append(metrics, createPoint("features_enabled.consumers"))
+	}
+	for _, consumerType := range s.features.EnabledConsumers {
+		metrics = append(metrics, createPoint("consumers_enabled."+consumerType))
+	}
 	if s.features.GrpcAPI {
 		metrics = append(metrics, createPoint("features_enabled.grpc_api"))
 	}
@@ -601,4 +611,14 @@ func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken str
 	}
 
 	return nil
+}
+
+func GetEnabledConsumers(consumers []consuming.ConsumerConfig) []string {
+	var enabledConsumers []string
+	for _, c := range consumers {
+		if !c.Disabled && !slices.Contains(enabledConsumers, string(c.Type)) {
+			enabledConsumers = append(enabledConsumers, string(c.Type))
+		}
+	}
+	return enabledConsumers
 }
