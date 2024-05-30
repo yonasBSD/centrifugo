@@ -16,7 +16,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	stdlog "log"
@@ -71,7 +70,6 @@ import (
 	"github.com/centrifugal/centrifuge"
 	"github.com/justinas/alice"
 	"github.com/mattn/go-isatty"
-	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go/http3"
@@ -138,6 +136,8 @@ var defaults = map[string]any{
 	"global_presence_ttl":                60 * time.Second,
 	"global_redis_presence_user_mapping": false,
 
+	"allowed_delta_types": []centrifuge.DeltaType{},
+
 	"presence":                      false,
 	"join_leave":                    false,
 	"force_push_join_leave":         false,
@@ -148,6 +148,7 @@ var defaults = map[string]any{
 	"allow_positioning":             false,
 	"force_recovery":                false,
 	"allow_recovery":                false,
+	"force_recovery_mode":           "",
 	"allow_subscribe_for_anonymous": false,
 	"allow_subscribe_for_client":    false,
 	"allow_publish_for_anonymous":   false,
@@ -173,17 +174,19 @@ var defaults = map[string]any{
 	"allow_anonymous_connect_without_token": false,
 	"disallow_anonymous_connection_tokens":  false,
 
-	"client_expired_close_delay":          25 * time.Second,
-	"client_expired_sub_close_delay":      25 * time.Second,
-	"client_stale_close_delay":            10 * time.Second,
-	"client_channel_limit":                128,
-	"client_queue_max_size":               1048576, // 1 MB
-	"client_presence_update_interval":     27 * time.Second,
-	"client_user_connection_limit":        0,
-	"client_concurrency":                  0,
-	"client_channel_position_check_delay": 40 * time.Second,
-	"client_connection_limit":             0,
-	"client_connection_rate_limit":        0,
+	"client_expired_close_delay":           25 * time.Second,
+	"client_expired_sub_close_delay":       25 * time.Second,
+	"client_stale_close_delay":             10 * time.Second,
+	"client_channel_limit":                 128,
+	"client_queue_max_size":                1048576, // 1 MB
+	"client_presence_update_interval":      27 * time.Second,
+	"client_user_connection_limit":         0,
+	"client_concurrency":                   0,
+	"client_channel_position_check_delay":  40 * time.Second,
+	"client_channel_position_max_time_lag": 0,
+	"client_connection_limit":              0,
+	"client_connection_rate_limit":         0,
+	"client_connect_include_server_time":   false,
 
 	"channel_max_length":         255,
 	"channel_private_prefix":     "$",
@@ -557,12 +560,12 @@ func main() {
 
 			granularProxyMode := viper.GetBool("granular_proxy_mode")
 			var proxyMap *client.ProxyMap
-			var proxyEnabled bool
+			var keepHeadersInContext bool
 			if granularProxyMode {
-				proxyMap, proxyEnabled = granularProxyMapConfig(ruleConfig)
+				proxyMap, keepHeadersInContext = granularProxyMapConfig(ruleConfig)
 				log.Info().Msg("using granular proxy configuration")
 			} else {
-				proxyMap, proxyEnabled = proxyMapConfig()
+				proxyMap, keepHeadersInContext = proxyMapConfig()
 			}
 
 			nodeCfg := nodeConfig(build.Version)
@@ -813,7 +816,6 @@ func main() {
 				log.Info().Msgf("serving unidirectional GRPC on %s", grpcUniAddr)
 			}
 
-			keepHeadersInContext := proxyEnabled
 			httpServers, err := runHTTPServers(node, ruleContainer, httpAPIExecutor, keepHeadersInContext)
 			if err != nil {
 				log.Fatal().Msgf("error running HTTP server: %v", err)
@@ -1581,7 +1583,7 @@ func runHTTPServers(n *centrifuge.Node, ruleContainer *rule.Container, apiExecut
 
 		if useHTTP3 {
 			server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_ = wtServer.H3.SetQuicHeaders(w.Header())
+				_ = wtServer.H3.SetQUICHeaders(w.Header())
 				mux.ServeHTTP(w, r)
 			})
 		}
@@ -1705,6 +1707,7 @@ func ruleConfig() rule.Config {
 	cfg.AllowPositioning = v.GetBool("allow_positioning")
 	cfg.AllowRecovery = v.GetBool("allow_recovery")
 	cfg.ForceRecovery = v.GetBool("force_recovery")
+	cfg.ForceRecoveryMode = v.GetString("force_recovery_mode")
 	cfg.SubscribeForAnonymous = v.GetBool("allow_subscribe_for_anonymous")
 	cfg.SubscribeForClient = v.GetBool("allow_subscribe_for_client")
 	cfg.PublishForAnonymous = v.GetBool("allow_publish_for_anonymous")
@@ -1728,6 +1731,11 @@ func ruleConfig() rule.Config {
 	cfg.ProxySubscribeStreamBidirectional = v.GetBool("proxy_subscribe_stream_bidirectional")
 	// GlobalHistoryMetaTTL is required here only for validation purposes.
 	cfg.GlobalHistoryMetaTTL = GetDuration("global_history_meta_ttl", true)
+	cfg.DeltaPublish = v.GetBool("delta_publish")
+	allowedDeltaTypes := v.GetStringSlice("allowed_delta_types")
+	for _, dt := range allowedDeltaTypes {
+		cfg.AllowedDeltaTypes = append(cfg.AllowedDeltaTypes, centrifuge.DeltaType(dt))
+	}
 
 	cfg.Namespaces = namespacesFromConfig(v)
 
@@ -1758,28 +1766,7 @@ func rpcNamespacesFromConfig(v *viper.Viper) []rule.RpcNamespace {
 	if !v.IsSet("rpc_namespaces") {
 		return ns
 	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("rpc_namespaces").(type) {
-	case string:
-		jsonData, _ = json.Marshal(val)
-		err = json.Unmarshal([]byte(val), &ns)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&ns)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-			return ns
-		}
-		err = decoder.Decode(v.Get("rpc_namespaces"))
-	default:
-		err = fmt.Errorf("unknown rpc_namespaces type: %T", val)
-	}
-	if err != nil {
-		log.Error().Err(err).Msg("malformed rpc_namespaces")
-		os.Exit(1)
-	}
+	jsonData := tools.DecodeSlice(v, &ns, "rpc_namespaces")
 	rule.WarnUnknownRpcNamespaceKeys(jsonData)
 	return ns
 }
@@ -1790,28 +1777,7 @@ func namespacesFromConfig(v *viper.Viper) []rule.ChannelNamespace {
 	if !v.IsSet("namespaces") {
 		return ns
 	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("namespaces").(type) {
-	case string:
-		jsonData = []byte(val)
-		err = json.Unmarshal([]byte(val), &ns)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&ns)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-			return ns
-		}
-		err = decoder.Decode(v.Get("namespaces"))
-	default:
-		err = fmt.Errorf("unknown namespaces type: %T", val)
-	}
-	if err != nil {
-		log.Error().Err(err).Msg("malformed namespaces")
-		os.Exit(1)
-	}
+	jsonData := tools.DecodeSlice(v, &ns, "namespaces")
 	rule.WarnUnknownNamespaceKeys(jsonData)
 	return ns
 }
@@ -1824,27 +1790,9 @@ func granularProxiesFromConfig(v *viper.Viper) []proxy.Config {
 	if !v.IsSet("proxies") {
 		return proxies
 	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("proxies").(type) {
-	case string:
-		jsonData = []byte(val)
-		err = json.Unmarshal([]byte(val), &proxies)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&proxies)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-			return proxies
-		}
-		err = decoder.Decode(v.Get("proxies"))
-	default:
-		err = fmt.Errorf("unknown proxies type: %T", val)
-	}
-	if err != nil {
-		log.Fatal().Err(err).Msg("malformed proxies")
-	}
+	jsonData := tools.DecodeSlice(v, &proxies, "proxies")
+	proxy.WarnUnknownProxyKeys(jsonData)
+
 	names := map[string]struct{}{}
 	for _, p := range proxies {
 		if !proxyNameRe.Match([]byte(p.Name)) {
@@ -1862,8 +1810,6 @@ func granularProxiesFromConfig(v *viper.Viper) []proxy.Config {
 		names[p.Name] = struct{}{}
 	}
 
-	proxy.WarnUnknownProxyKeys(jsonData)
-
 	return proxies
 }
 
@@ -1873,27 +1819,7 @@ func consumersFromConfig(v *viper.Viper) []consuming.ConsumerConfig {
 	if !v.IsSet("consumers") {
 		return consumers
 	}
-	var jsonData []byte
-	var err error
-	switch val := v.Get("consumers").(type) {
-	case string:
-		jsonData, _ = json.Marshal(val)
-		err = json.Unmarshal([]byte(val), &consumers)
-	case []any:
-		jsonData, _ = json.Marshal(val)
-		decoderCfg := tools.DecoderConfig(&consumers)
-		decoder, newErr := mapstructure.NewDecoder(decoderCfg)
-		if newErr != nil {
-			log.Fatal().Msg(newErr.Error())
-		}
-		err = decoder.Decode(v.Get("consumers"))
-	default:
-		err = fmt.Errorf("unknown consumers type: %T", val)
-	}
-	if err != nil {
-		log.Error().Err(err).Msg("malformed consumers")
-		os.Exit(1)
-	}
+	jsonData := tools.DecodeSlice(v, &consumers, "consumers")
 	consuming.WarnUnknownConsumerConfigKeys(jsonData)
 	return consumers
 }
@@ -2107,11 +2033,11 @@ func proxyMapConfig() (*client.ProxyMap, bool) {
 		log.Info().Str("endpoint", proxyStreamSubscribeEndpoint).Msg("subscribe stream proxy enabled")
 	}
 
-	proxyEnabled := connectEndpoint != "" || refreshEndpoint != "" ||
+	keepHeadersInContext := connectEndpoint != "" || refreshEndpoint != "" ||
 		rpcEndpoint != "" || subscribeEndpoint != "" || publishEndpoint != "" ||
 		subRefreshEndpoint != "" || proxyStreamSubscribeEndpoint != ""
 
-	return proxyMap, proxyEnabled
+	return proxyMap, keepHeadersInContext
 }
 
 func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
@@ -2121,6 +2047,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 		SubscribeProxies:       map[string]proxy.SubscribeProxy{},
 		SubRefreshProxies:      map[string]proxy.SubRefreshProxy{},
 		SubscribeStreamProxies: map[string]*proxy.SubscribeStreamProxy{},
+		CacheEmptyProxies:      map[string]proxy.CacheEmptyProxy{},
 	}
 	proxyList := granularProxiesFromConfig(viper.GetViper())
 	proxies := make(map[string]proxy.Config)
@@ -2131,7 +2058,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 		proxies[p.Name] = p
 	}
 
-	var proxyEnabled bool
+	var keepHeadersInContext bool
 
 	connectProxyName := viper.GetString("connect_proxy_name")
 	if connectProxyName != "" {
@@ -2144,7 +2071,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 		if err != nil {
 			log.Fatal().Msgf("error creating connect proxy: %v", err)
 		}
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 	refreshProxyName := viper.GetString("refresh_proxy_name")
 	if refreshProxyName != "" {
@@ -2157,7 +2084,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 		if err != nil {
 			log.Fatal().Msgf("error creating refresh proxy: %v", err)
 		}
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 	subscribeProxyName := ruleConfig.SubscribeProxyName
 	if subscribeProxyName != "" {
@@ -2170,7 +2097,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 			log.Fatal().Msgf("error creating subscribe proxy: %v", err)
 		}
 		proxyMap.SubscribeProxies[subscribeProxyName] = sp
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 
 	publishProxyName := ruleConfig.PublishProxyName
@@ -2184,7 +2111,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 			log.Fatal().Msgf("error creating publish proxy: %v", err)
 		}
 		proxyMap.PublishProxies[publishProxyName] = pp
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 
 	subRefreshProxyName := ruleConfig.SubRefreshProxyName
@@ -2198,7 +2125,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 			log.Fatal().Msgf("error creating publish proxy: %v", err)
 		}
 		proxyMap.SubRefreshProxies[subRefreshProxyName] = srp
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 
 	subscribeStreamProxyName := ruleConfig.SubscribeStreamProxyName
@@ -2215,7 +2142,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 			log.Fatal().Msgf("error creating subscribe proxy: %v", err)
 		}
 		proxyMap.SubscribeStreamProxies[subscribeProxyName] = sp
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 
 	for _, ns := range ruleConfig.Namespaces {
@@ -2234,7 +2161,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 				log.Fatal().Msgf("error creating subscribe proxy: %v", err)
 			}
 			proxyMap.SubscribeProxies[subscribeProxyName] = sp
-			proxyEnabled = true
+			keepHeadersInContext = true
 		}
 
 		if publishProxyName != "" {
@@ -2247,7 +2174,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 				log.Fatal().Msgf("error creating publish proxy: %v", err)
 			}
 			proxyMap.PublishProxies[publishProxyName] = pp
-			proxyEnabled = true
+			keepHeadersInContext = true
 		}
 
 		if subRefreshProxyName != "" {
@@ -2260,7 +2187,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 				log.Fatal().Msgf("error creating sub refresh proxy: %v", err)
 			}
 			proxyMap.SubRefreshProxies[subRefreshProxyName] = srp
-			proxyEnabled = true
+			keepHeadersInContext = true
 		}
 
 		if subscribeStreamProxyName != "" {
@@ -2276,7 +2203,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 				log.Fatal().Msgf("error creating subscribe stream proxy: %v", err)
 			}
 			proxyMap.SubscribeStreamProxies[subscribeStreamProxyName] = ssp
-			proxyEnabled = true
+			keepHeadersInContext = true
 		}
 	}
 
@@ -2291,7 +2218,7 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 			log.Fatal().Msgf("error creating rpc proxy: %v", err)
 		}
 		proxyMap.RpcProxies[rpcProxyName] = rp
-		proxyEnabled = true
+		keepHeadersInContext = true
 	}
 
 	for _, ns := range ruleConfig.RpcNamespaces {
@@ -2306,11 +2233,11 @@ func granularProxyMapConfig(ruleConfig rule.Config) (*client.ProxyMap, bool) {
 				log.Fatal().Msgf("error creating rpc proxy: %v", err)
 			}
 			proxyMap.RpcProxies[rpcProxyName] = rp
-			proxyEnabled = true
+			keepHeadersInContext = true
 		}
 	}
 
-	return proxyMap, proxyEnabled
+	return proxyMap, keepHeadersInContext
 }
 
 func nodeConfig(version string) centrifuge.Config {
@@ -2327,11 +2254,13 @@ func nodeConfig(version string) centrifuge.Config {
 	cfg.ClientQueueMaxSize = v.GetInt("client_queue_max_size")
 	cfg.ClientChannelLimit = v.GetInt("client_channel_limit")
 	cfg.ClientChannelPositionCheckDelay = GetDuration("client_channel_position_check_delay")
+	cfg.ClientChannelPositionMaxTimeLag = GetDuration("client_channel_position_max_time_lag")
 	cfg.UserConnectionLimit = v.GetInt("client_user_connection_limit")
 	cfg.NodeInfoMetricsAggregateInterval = GetDuration("node_info_metrics_aggregate_interval")
 	cfg.HistoryMaxPublicationLimit = v.GetInt("client_history_max_publication_limit")
 	cfg.RecoveryMaxPublicationLimit = v.GetInt("client_recovery_max_publication_limit")
 	cfg.HistoryMetaTTL = GetDuration("global_history_meta_ttl", true)
+	cfg.ClientConnectIncludeServerTime = v.GetBool("client_connect_include_server_time")
 
 	level, ok := logStringToLevel[strings.ToLower(v.GetString("log_level"))]
 	if !ok {
